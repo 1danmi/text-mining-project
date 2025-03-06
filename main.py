@@ -1,9 +1,11 @@
 import csv
 import json
 
+from transformers import AutoTokenizer
+from sentence_transformer_service import SentenceTransformerService
+
 from prompts import *
 from llm_service import llm_service
-from sentence_transformer_service import SentenceTransformerService
 from datasets import get_spam_dataset, sample_dataset, get_imdb_dataset, get_r8_dataset, get_amazon_dataset
 
 GET_DATASET = {"imdb": get_imdb_dataset, "spam": get_spam_dataset, "amazon": get_amazon_dataset, "r8": get_r8_dataset}
@@ -20,6 +22,21 @@ PROMPTS = {
     "r8": R8_PROMPT_TEMPLATE,
     "r8_simple": R8_SIMPLE_PROMPT_TEMPLATE,
 }
+
+tokenizer = AutoTokenizer.from_pretrained("sentence-transformers/all-MiniLM-L6-v2")
+
+
+def trim_text(text, max_tokens):
+    # Tokenize the text
+    tokens = tokenizer.encode(text, add_special_tokens=False)
+
+    # Trim to max_tokens
+    trimmed_tokens = tokens[:max_tokens]
+
+    # Decode back to text while preserving newlines and spaces
+    trimmed_text = tokenizer.decode(trimmed_tokens, skip_special_tokens=True, clean_up_tokenization_spaces=False)
+
+    return trimmed_text
 
 
 def detect_label(response: str, labels: set[str]):
@@ -58,28 +75,29 @@ def run_llm(
         | {label: 0 for label in labels}
         | {f"predicted_{label}": 0 for label in labels}
     )
-
+    prompt_tokens = len(tokenizer(prompt_template)["input_ids"])
     sentence_transformer_service = SentenceTransformerService(dataset)
 
     for text, label in dataset.items():
         counts["count"] += 1
-        if counts["count"] % 100 == 0:
-            if counts["correct"] / counts["count"] < 0.5:
-                print(
-                    f"Stopped with {model_name} after {counts['count']} iterations because accuracy is {counts['correct'] / counts['count']}"
-                )
-                break
         print(f"Text {counts["count"]}/{dataset_length}")
         counts[label] += 1
+
+        token_limit = (480 - prompt_tokens) // (num_of_shot + 1)
         examples = sentence_transformer_service.find_top_n_matches(text, num_of_shot)
-        examples_text = "".join(example_template.format(text=example, label=dataset[example]) for example in examples)
-        token_limit = 500 - len(prompt_template.split(" ")) - len(examples_text.split(" "))
-        if token_limit < 10:
-            continue
-        dataset_text = " ".join(text.split(" ")[:token_limit])
-        response = service.generate(
-            prompt_template.format(examples=examples_text, dataset_text=dataset_text), stop=["Text"]
+        trimmed_examples = {example: trim_text(example, token_limit) for example in examples}
+        examples_text = "".join(
+            example_template.format(text=trimmed_example, label=dataset[example])
+            for example, trimmed_example in trimmed_examples.items()
         )
+
+        trimmed_text = trim_text(text, token_limit)
+        try:
+            response = service.generate(
+                prompt_template.format(examples=examples_text, dataset_text=trimmed_text), stop=["Text"]
+            )
+        except Exception:
+            continue
         predicted_label = detect_label(response, labels)
         counts[f"predicted_{predicted_label}"] += 1
         if predicted_label == label:
@@ -92,7 +110,7 @@ def run_llm(
         print(f"Accuracy: {counts['correct'] / counts['count']}")
 
     del service
-    with open(f"results/{task_name}_{model_name}_final_results.csv", mode="w") as file:
+    with open(f"results/{task_name}_{model_name}_summary.json", mode="w") as file:
         json.dump(counts, file, indent=4)
 
     return counts
@@ -108,9 +126,12 @@ if __name__ == "__main__":
     # ("model/llama-2-7b.Q4_K_M.gguf", "llama-2-7b"),
 
     models = [
-        ("models/Qwen2.5-7B-Instruct.Q8_0.gguf", "Qwen-7b-instruct"),
+        ("models/Qwen2.5-7B-Instruct.Q8_0.gguf", "Qwen-7b-instruct"),  # MaziyarPanahi/Qwen2.5-7B-Instruct-GGUF
         ("models/Hermes-3-Llama-3.1-8B.Q8_0.gguf", "hermes-3-llama-3.1-8b"),
-        ("models/Mistral-7B-Instruct-v0.3.Q8_0.gguf", "mistral-7b-instruct"),
+        (
+            "models/Mistral-7B-Instruct-v0.3.Q8_0.gguf",
+            "mistral-7b-instruct",
+        ),  # https://huggingface.co/MaziyarPanahi/Mistral-7B-Instruct-v0.3-GGUF
     ]
     datasets = [
         ("amazon", get_amazon_dataset),
@@ -130,6 +151,22 @@ if __name__ == "__main__":
                 model_path=model,
                 model_name=model_name,
                 dataset=dataset,
+                task_name=f"{dataset_name}",
+                prompt_template=PROMPTS[dataset_name],
+                labels=labels,
+            )
+            run_llm(
+                model_path=model,
+                model_name=model_name,
+                dataset=dataset,
+                task_name=f"{dataset_name}_simple",
+                prompt_template=PROMPTS[f"{dataset_name}_simple"],
+                labels=labels,
+            )
+            run_llm(
+                model_path=model,
+                model_name=model_name,
+                dataset=dataset,
                 task_name=f"{dataset_name}_one_shot",
                 prompt_template=PROMPTS[dataset_name],
                 labels=labels,
@@ -142,7 +179,7 @@ if __name__ == "__main__":
                 dataset=dataset,
                 task_name=f"{dataset_name}_simple_one_shot",
                 prompt_template=PROMPTS[f"{dataset_name}_simple"],
-                labels=set(dataset.values()),
+                labels=labels,
                 example_template=EXAMPLE_TEMPLATE[dataset_name],
                 num_of_shot=1,
             )
